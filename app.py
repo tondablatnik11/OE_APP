@@ -1,12 +1,11 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, time
 
 # --- 1. KONFIGURACE ---
-st.set_page_config(page_title="Logistics Performance Analyzer", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Logistics Perf. Analyzer v2.2", page_icon="📈", layout="wide")
 
 st.markdown("""
     <style>
@@ -17,50 +16,62 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. POMOCNÉ FUNKCE ---
-def parse_time_duration(val):
-    """Převede různé formáty času (HH:MM:SS, nebo datetime) na minuty (float)."""
+# --- 2. ROBUSTNÍ FUNKCE PRO ČAS ---
+def parse_time_to_minutes(val):
+    """Převede jakýkoliv formát času na minuty (int)."""
     if pd.isna(val) or val == "":
         return None
     
-    # Pokud je to už datetime objekt (např. z Excelu)
+    # 1. Pokud je to datetime/timestamp
     if isinstance(val, (datetime, pd.Timestamp)):
         return val.hour * 60 + val.minute + val.second / 60
     
-    # Pokud je to string
-    val = str(val).strip()
+    # 2. Pokud je to objekt time
+    if hasattr(val, 'hour'):
+        return val.hour * 60 + val.minute + val.second / 60
+    
+    # 3. Pokud je to string
+    val_str = str(val).strip()
+    
+    # Oříznutí data (1900-01-01 14:00:00 -> 14:00:00)
+    if " " in val_str:
+        val_str = val_str.split(" ")[-1]
+        
     try:
-        # Zkus formát HH:MM:SS nebo HH:MM
-        parts = val.split(':')
-        if len(parts) == 3:
+        parts = val_str.split(':')
+        if len(parts) == 3: # HH:MM:SS
             return int(parts[0]) * 60 + int(parts[1]) + int(parts[2]) / 60
-        elif len(parts) == 2:
+        elif len(parts) == 2: # HH:MM
             return int(parts[0]) * 60 + int(parts[1])
     except:
         return None
     return None
 
-def clean_time_string(t_str):
-    """Opraví časový string pro výpočty."""
-    if pd.isna(t_str): return None
-    t_str = str(t_str).strip()
-    # Pokud Excel udělal z času datum (např. 1900-01-01 14:00:00)
-    if " " in t_str:
-        t_str = t_str.split(" ")[1]
-    return t_str
+def calculate_duration(row):
+    """Vypočítá trvání ze START a END, pokud není Process Time."""
+    # Pokud už máme Duration_Min (z Process Time), použijeme to
+    if pd.notna(row.get('Duration_Min')) and row['Duration_Min'] > 0:
+        return row['Duration_Min']
+    
+    # Jinak počítáme z Start/End
+    s = parse_time_to_minutes(row.get('START'))
+    e = parse_time_to_minutes(row.get('END'))
+    
+    if s is not None and e is not None:
+        diff = e - s
+        if diff < 0: # Přechod přes půlnoc
+            diff += 24 * 60
+        return diff
+    return None
 
 # --- 3. APLIKACE ---
-st.title("📈 Logistics Performance Analyzer")
-st.markdown("Detailní analýza výkonnosti balení, časů a materiálů.")
+st.title("📈 Logistics Performance Analyzer v2.2")
 
-# SIDEBAR
 with st.sidebar:
     st.header("Vstupní data")
     uploaded_file = st.file_uploader("1. Hlavní data (All.csv / Excel)", type=['csv', 'xlsx'])
-    breaks_file = st.file_uploader("2. Přestávky (Breaks.csv) - Volitelné", type=['csv', 'xlsx'])
-    
-    st.markdown("---")
-    st.caption("Verze 2.0 | Performance Focus")
+    breaks_file = st.file_uploader("2. Přestávky (Breaks.csv)", type=['csv', 'xlsx'])
+    st.info("Verze 2.2: Oprava načítání časů a výpočet START/END.")
 
 if uploaded_file:
     try:
@@ -69,187 +80,130 @@ if uploaded_file:
             df = pd.read_csv(uploaded_file)
         else:
             df = pd.read_excel(uploaded_file)
-
-        # Normalizace názvů sloupců (aby to fungovalo pro různé verze souborů)
-        # Zkusíme najít klíčové sloupce, i když se jmenují trochu jinak
-        cols_map = {
-            col: col for col in df.columns
-        }
-        # Hledání "Process Time - cleaned" nebo "Process Time"
-        time_col = None
-        for c in df.columns:
-            if "cleaned" in c.lower() and "time" in c.lower():
-                time_col = c
-                break
-        if not time_col:
-            for c in df.columns:
-                if "process time" in c.lower():
-                    time_col = c
-                    break
-        
-        # PŘÍPRAVA DAT
-        # 1. Čas trvání (Duration) v minutách
-        if time_col:
-            df['Duration_Min'] = df[time_col].apply(parse_time_duration)
-        else:
-            # Pokud není sloupec s trváním, zkusíme vypočítat z START a END
-            st.warning("Nenalezen sloupec 'Process Time', počítám z 'START' a 'END'.")
-            # (Zde by byla logika pro výpočet Start-End, pro teď předpokládáme, že Process Time existuje dle tvých dat)
-            df['Duration_Min'] = 0
-
-        # Odstranění řádků bez času (chyby)
-        df = df[df['Duration_Min'] > 0].copy()
-
-        # 2. Počty kusů
-        qty_col = 'Number of pieces' if 'Number of pieces' in df.columns else df.columns[df.columns.str.contains('pieces')][0]
-        df['Pieces'] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0)
-        
-        # 3. Čas na 1 kus
-        df['Min_per_Piece'] = df['Duration_Min'] / df['Pieces']
-        # Ošetření dělení nulou
-        df.loc[df['Pieces'] == 0, 'Min_per_Piece'] = 0
-
-        # 4. Hodina začátku (pro časovou osu)
-        start_col = 'START' if 'START' in df.columns else df.columns[df.columns.str.contains('START', case=False)][0]
-        df['Start_Hour'] = df[start_col].astype(str).apply(lambda x: clean_time_string(x).split(':')[0] if clean_time_string(x) and ':' in clean_time_string(x) else '00').astype(int)
-
-        # --- DASHBOARD ---
-        
-        # 1. HLAVNÍ METRIKY
-        st.subheader("🚀 Celková produktivita")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        avg_order_time = df['Duration_Min'].mean()
-        avg_piece_time = df['Min_per_Piece'].mean() # Průměr průměrů
-        # Nebo lépe: Celkový čas / Celkové kusy (vážený průměr)
-        weighted_avg_piece_time = df['Duration_Min'].sum() / df['Pieces'].sum()
-
-        col1.metric("Ø Čas na Zakázku", f"{avg_order_time:.1f} min")
-        col2.metric("Ø Čas na 1 Kus", f"{weighted_avg_piece_time:.2f} min")
-        col3.metric("Celkem Zakázek", len(df))
-        col4.metric("Celkem Kusů", f"{df['Pieces'].sum():,.0f}")
-
-        st.divider()
-
-        # 2. ANALÝZA ARTIKLŮ (MATERIAL)
-        st.subheader("📦 Analýza Materiálů (Top 15 nejpomalejších)")
-        st.caption("Které materiály trvá zabalit nejdéle (v průměru na 1 kus)?")
-        
-        mat_stats = df.groupby('Material').agg({
-            'Duration_Min': 'mean',         # Průměrný čas na zakázku
-            'Min_per_Piece': 'mean',        # Průměrný čas na kus
-            'DN NUMBER (SAP)': 'count',     # Počet zakázek
-            'Pieces': 'sum'                 # Celkem kusů
-        }).reset_index()
-        
-        # Filtr: Bereme jen materiály, co se dělaly alespoň 3x (aby to nezkreslila jedna chyba)
-        mat_stats_filtered = mat_stats[mat_stats['DN NUMBER (SAP)'] >= 3]
-        
-        # Seřazení podle času na kus
-        top_slowest = mat_stats_filtered.sort_values(by='Min_per_Piece', ascending=False).head(15)
-        
-        st.dataframe(
-            top_slowest, 
-            column_config={
-                "Material": "Materiál",
-                "Duration_Min": st.column_config.NumberColumn("Ø Čas Zakázka (min)", format="%.1f"),
-                "Min_per_Piece": st.column_config.NumberColumn("Ø Čas/Kus (min)", format="%.2f"),
-                "DN NUMBER (SAP)": st.column_config.NumberColumn("Počet zakázek"),
-                "Pieces": st.column_config.NumberColumn("Celkem kusů")
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-
-        col_l, col_r = st.columns(2)
-        
-        # 3. ZÁKAZNÍCI (Scatter Plot)
-        with col_l:
-            st.subheader("👥 Analýza Zákazníků")
-            cust_stats = df.groupby('CUSTOMER').agg({
-                'DN NUMBER (SAP)': 'count',
-                'Duration_Min': 'sum'
-            }).reset_index()
-            cust_stats.columns = ['Zákazník', 'Počet Zakázek', 'Celkový Čas (min)']
             
-            # Graf
-            fig_cust = px.scatter(cust_stats, x='Počet Zakázek', y='Celkový Čas (min)', 
-                                  size='Celkový Čas (min)', hover_name='Zákazník', text='Zákazník',
-                                  title="Zákazníci: Počet zakázek vs. Celkový čas",
-                                  color='Celkový Čas (min)', color_continuous_scale='Bluered')
-            fig_cust.update_traces(textposition='top center')
-            st.plotly_chart(fig_cust, use_container_width=True)
+        # Očištění názvů sloupců
+        df.columns = [str(c).strip() for c in df.columns]
 
-        # 4. OBALOVÝ MATERIÁL
-        with col_r:
-            st.subheader("📦 Využití Obalů")
-            # Součet sloupců s obaly
-            pack_sums = {
-                'Palety': df['Number of pallets'].sum() if 'Number of pallets' in df.columns else 0,
-                'KLT': df['Number of KLTs'].sum() if 'Number of KLTs' in df.columns else 0,
-                'Kartony': df['Cartons'].sum() if 'Cartons' in df.columns else 0 # Nutno ověřit název sloupce v tvém CSV
-            }
-            # Pokud sloupec Cartons není, zkusíme ho najít
-            if pack_sums['Kartony'] == 0:
-                 # Hledáme sloupec co obsahuje 'carton' nebo 'box'
-                 carton_cols = [c for c in df.columns if 'carton' in c.lower()]
-                 if carton_cols:
-                     pack_sums['Kartony'] = df[carton_cols[0]].sum()
+        # --- A. DETEKCE SLOUPCE S ČASEM ---
+        # Hledáme sloupec s trváním (Process Time)
+        time_col = None
+        
+        # 1. Zkusíme najít "cleaned" (očištěný čas)
+        cleaned_candidates = [c for c in df.columns if "cleaned" in c.lower() and "time" in c.lower()]
+        if cleaned_candidates:
+            # Ověříme, zda není prázdný!
+            if df[cleaned_candidates[0]].notna().sum() > 10: # Alespoň 10 vyplněných řádků
+                time_col = cleaned_candidates[0]
+                st.success(f"Používám očištěný čas: {time_col}")
+        
+        # 2. Pokud není cleaned, hledáme obyčejný Process Time
+        if not time_col:
+            process_candidates = [c for c in df.columns if "process" in c.lower() and "time" in c.lower()]
+            if process_candidates:
+                time_col = process_candidates[0]
+                st.info(f"Používám sloupec: {time_col}")
 
-            pack_df = pd.DataFrame(list(pack_sums.items()), columns=['Typ', 'Počet'])
-            fig_pack = px.pie(pack_df, values='Počet', names='Typ', title="Podíl použitých obalových jednotek", hole=0.4)
-            st.plotly_chart(fig_pack, use_container_width=True)
+        # --- B. PŘEVOD ČASŮ ---
+        if time_col:
+            df['Duration_Min'] = df[time_col].apply(parse_time_to_minutes)
+        else:
+            df['Duration_Min'] = None # Zatím nic
+
+        # --- C. DOPOČET Z START/END (FALLBACK) ---
+        # Pokud chybí sloupec Process Time nebo je řádek prázdný, zkusíme START/END
+        if 'START' in df.columns and 'END' in df.columns:
+            # Aplikujeme výpočet řádek po řádku
+            df['Duration_Min'] = df.apply(calculate_duration, axis=1)
+            
+            # Kolik jsme jich dopočítali?
+            calc_count = df['Duration_Min'].notna().sum()
+            if not time_col:
+                st.warning(f"Sloupec 'Process Time' nenalezen. Dopočítáno {calc_count} řádků ze START/END.")
+
+        # --- D. FILTRACE A ČIŠTĚNÍ ---
+        # Odstraníme řádky, kde se nepovedlo zjistit čas
+        df_clean = df[df['Duration_Min'] > 0].copy()
+        
+        if df_clean.empty:
+            st.error("❌ Nepodařilo se načíst žádná data s platným časem.")
+            st.write("Zkontrolujte, zda soubor obsahuje sloupce 'Process Time' nebo 'START' a 'END' ve správném formátu.")
+            st.write("Nalezené sloupce:", df.columns.tolist())
+            st.stop()
+
+        # Počty kusů (Pieces)
+        qty_col = None
+        possible_qty = [c for c in df.columns if 'piece' in c.lower() or 'kus' in c.lower()]
+        if possible_qty:
+            qty_col = possible_qty[0]
+            df_clean['Pieces'] = pd.to_numeric(df_clean[qty_col], errors='coerce').fillna(0)
+        else:
+            df_clean['Pieces'] = 1 # Fallback
+            st.warning("Nenalezen sloupec 'Number of pieces', počítám 1 kus na zakázku.")
+
+        # Výpočet minuty na kus
+        df_clean['Min_per_Piece'] = df_clean['Duration_Min'] / df_clean['Pieces']
+        # Fix pro dělení nulou
+        df_clean.loc[df_clean['Pieces'] == 0, 'Min_per_Piece'] = 0
+
+        # --- E. DASHBOARD (Zobrazení) ---
+        
+        # 1. METRIKY
+        st.subheader("📊 Přehled Výkonnosti")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Ø Čas na Zakázku", f"{df_clean['Duration_Min'].mean():.1f} min")
+        
+        # Vážený průměr pro čas na kus (přesnější než průměr průměrů)
+        total_time = df_clean['Duration_Min'].sum()
+        total_pieces = df_clean['Pieces'].sum()
+        weighted_avg = total_time / total_pieces if total_pieces > 0 else 0
+        
+        c2.metric("Ø Čas na 1 Kus", f"{weighted_avg:.2f} min")
+        c3.metric("Zpracováno Zakázek", len(df_clean))
+        c4.metric("Zpracováno Kusů", f"{int(total_pieces):,}")
 
         st.divider()
 
-        # 5. ČASOVÁ OSA (Špičky)
-        st.subheader("⏰ Vytížení v průběhu dne")
-        hourly_counts = df.groupby('Start_Hour')['DN NUMBER (SAP)'].count().reset_index()
-        hourly_counts.columns = ['Hodina', 'Počet Zakázek']
+        # 2. TOP MATERIÁLY
+        col_mat, col_cust = st.columns(2)
         
-        fig_timeline = px.bar(hourly_counts, x='Hodina', y='Počet Zakázek', 
-                              title="Počet zahájených zakázek dle hodiny",
-                              color='Počet Zakázek', color_continuous_scale='Viridis')
-        fig_timeline.update_layout(xaxis=dict(tickmode='linear', dtick=1))
-        st.plotly_chart(fig_timeline, use_container_width=True)
+        with col_mat:
+            st.subheader("🐌 Nejpomalejší Materiály")
+            if 'Material' in df_clean.columns:
+                mat_grp = df_clean.groupby('Material').agg(
+                    Avg_Time_Piece=('Min_per_Piece', 'mean'),
+                    Count=('Material', 'count')
+                ).reset_index()
+                # Filtr: jen ty, co se dělaly alespoň 3x
+                mat_grp = mat_grp[mat_grp['Count'] >= 3].sort_values('Avg_Time_Piece', ascending=False).head(10)
+                
+                fig_mat = px.bar(mat_grp, x='Avg_Time_Piece', y='Material', orientation='h',
+                                 title="Průměrný čas na 1 kus (min)",
+                                 text_auto='.2f')
+                fig_mat.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_mat, use_container_width=True)
+            else:
+                st.warning("Chybí sloupec 'Material'.")
 
-        # 6. KORELACE (Bonus)
-        st.subheader("🔍 Detail: Kusy vs. Čas (Hledání anomálií)")
-        st.caption("Každý bod je jedna zakázka. Body vysoko vlevo jsou 'pomalé' zakázky (málo kusů, hodně času).")
-        fig_corr = px.scatter(df, x='Pieces', y='Duration_Min', 
-                              hover_data=['Material', 'CUSTOMER', 'DN NUMBER (SAP)'],
-                              color='Duration_Min', opacity=0.6,
-                              labels={'Pieces': 'Počet Kusů', 'Duration_Min': 'Čas (min)'})
-        st.plotly_chart(fig_corr, use_container_width=True)
-
-        # --- EXPORT ---
+        # 3. ZÁKAZNÍCI
+        with col_cust:
+            st.subheader("🏢 Top Zákazníci dle Času")
+            cust_col = 'CUSTOMER' if 'CUSTOMER' in df_clean.columns else df_clean.columns[1] # Tip
+            cust_grp = df_clean.groupby(cust_col)['Duration_Min'].sum().reset_index().sort_values('Duration_Min', ascending=False).head(10)
+            
+            fig_cust = px.pie(cust_grp, values='Duration_Min', names=cust_col, hole=0.4,
+                              title="Celkový strávený čas (min)")
+            st.plotly_chart(fig_cust, use_container_width=True)
+            
+        # 4. EXPORT
         st.subheader("📥 Export Dat")
-        
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            # Sheet 1: Data pro Pivoty
-            df.to_excel(writer, sheet_name='Clean_Data', index=False)
-            
-            # Sheet 2: Material Stats
-            mat_stats.sort_values(by='Duration_Min', ascending=False).to_excel(writer, sheet_name='Material_Analysis', index=False)
-            
-            # Sheet 3: Customer Stats
-            cust_stats.sort_values(by='Celkový Čas (min)', ascending=False).to_excel(writer, sheet_name='Customer_Analysis', index=False)
-            
-            # Auto-adjust columns
-            worksheet = writer.sheets['Clean_Data']
-            worksheet.set_column(0, len(df.columns), 15)
-
-        st.download_button(
-            label="Stáhnout Analytický Excel (.xlsx)",
-            data=buffer.getvalue(),
-            file_name="Logistics_Analysis_Report.xlsx",
-            mime="application/vnd.ms-excel"
-        )
+            df_clean.to_excel(writer, index=False, sheet_name="Clean_Data")
+            if 'Material' in df_clean.columns:
+                mat_grp.to_excel(writer, index=False, sheet_name="Top_Materials")
+        
+        st.download_button("Stáhnout Analýzu (.xlsx)", buffer.getvalue(), "Logistics_Analysis_v2.xlsx")
 
     except Exception as e:
-        st.error(f"Chyba při zpracování dat: {e}")
-        st.warning("Zkontrolujte, zda soubor obsahuje sloupce jako 'Material', 'CUSTOMER', 'START', 'Process Time' atd.")
-
-else:
-    st.info("Nahrajte soubor s daty (All.csv nebo Excel) pro zobrazení dashboardu.")
+        st.error(f"Kritická chyba: {e}")
+        st.write("Prosím pošlete screenshot chyby, pokud přetrvává.")
